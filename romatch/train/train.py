@@ -24,6 +24,9 @@ def train_step(train_batch, model, objective, optimizer, grad_scaler, grad_clip_
     optimizer.zero_grad()
     out = model(train_batch)
     l = objective(out, train_batch)
+    for name, param in model.named_parameters():
+        if param.grad is not None and torch.isnan(param.grad).any():
+            print(f"NaN gradient detected in: {name}")
     grad_scaler.scale(l).backward()
     grad_scaler.unscale_(optimizer)
     log_param_statistics(model.named_parameters())

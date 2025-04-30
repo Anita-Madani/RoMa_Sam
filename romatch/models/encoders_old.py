@@ -7,14 +7,7 @@ import torchvision.models as tvm
 import gc
 from romatch.utils.utils import get_autocast_params
 from transformers import SamModel
-import torch.nn.functional as F
-import torch
-#https://stackoverflow.com/questions/59129812/how-to-avoid-cuda-out-of-memory-in-pytorch
-torch.cuda.empty_cache()
-torch.cuda.memory_summary(device=None, abbreviated=False)
-import gc
-gc.collect()
-
+import torch.distributed as dist
 
 class ResNet50(nn.Module):
     def __init__(self, pretrained=False, high_res = False, weights = None, 
@@ -88,18 +81,22 @@ class VGG19(nn.Module):
 class CNNandDinov2(nn.Module):
     def __init__(self, cnn_kwargs = None, amp = False, use_vgg = False, dinov2_weights = None, amp_dtype = torch.float16):
         super().__init__()
-        # if dinov2_weights is None:
-            # dinov2_weights = torch.hub.load_state_dict_from_url("https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth", map_location="cpu")
-        # from .transformer import vit_large
-        # vit_kwargs = dict(img_size= 518,
-            # patch_size= 14,
-            # init_values = 1.0,
-            # ffn_layer = "mlp",
-            # block_chunks = 0,
-        # )
+#        if dinov2_weights is None:
+#            dinov2_weights = torch.hub.load_state_dict_from_url("https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth", map_location="cpu")
+#        from .transformer import vit_large
+#        vit_kwargs = dict(img_size= 518,
+#            patch_size= 14,
+#            init_values = 1.0,
+#            ffn_layer = "mlp",
+#            block_chunks = 0,
+#        )
 
-        # dinov2_vitl14 = vit_large(**vit_kwargs).eval()
-        # dinov2_vitl14.load_state_dict(dinov2_weights)
+#        dinov2_vitl14 = vit_large(**vit_kwargs).eval()
+#        dinov2_vitl14.load_state_dict(dinov2_weights)
+        print("Loading SAM model from Hugging Face...")
+        sam_model_name="facebook/sam-vit-base"
+        self.sam_model = SamModel.from_pretrained(sam_model_name)
+        self.sam_encoder = self.sam_model.vision_encoder.eval()
         cnn_kwargs = cnn_kwargs if cnn_kwargs is not None else {}
         if not use_vgg:
             self.cnn = ResNet50(**cnn_kwargs)
@@ -107,17 +104,11 @@ class CNNandDinov2(nn.Module):
             self.cnn = VGG19(**cnn_kwargs)
         self.amp = amp
         self.amp_dtype = amp_dtype
-        print("Loading SAM model from Hugging Face...")
-        sam_model_name = "facebook/sam-vit-base"
-        sam_encoder = SamModel.from_pretrained(sam_model_name)
-        sam_encoder.eval()
-        if self.amp: 
-            sam_encoder = sam_encoder.to(self.amp_dtype)
-        self.sam_encoder = [sam_encoder]
-
-        # if self.amp:
-            # dinov2_vitl14 = dinov2_vitl14.to(self.amp_dtype)
-        # self.dinov2_vitl14 = [dinov2_vitl14] # ugly hack to not show parameters to DDP
+        if self.amp:
+            self.sam_encoder = self.sam_encoder.to(self.amp_dtype)
+#        if self.amp:
+#            dinov2_vitl14 = dinov2_vitl14.to(self.amp_dtype)
+#        self.dinov2_vitl14 = [dinov2_vitl14] # ugly hack to not show parameters to DDP
     
     
     def train(self, mode: bool = True):
@@ -126,29 +117,30 @@ class CNNandDinov2(nn.Module):
     def forward(self, x, upsample = False):
         B,C,H,W = x.shape
         feature_pyramid = self.cnn(x)
-        
         if not upsample:
             with torch.no_grad():
-                # if self.dinov2_vitl14[0].device != x.device:
-                    # self.dinov2_vitl14[0] = self.dinov2_vitl14[0].to(x.device).to(self.amp_dtype)
-                # dinov2_features_16 = self.dinov2_vitl14[0].forward_features(x.to(self.amp_dtype))
-                # features_16 = dinov2_features_16['x_norm_patchtokens'].permute(0,2,1).reshape(B,1024,H//14, W//14)
-                # del dinov2_features_16
-                x = F.interpolate(x, size=(1024, 1024), mode='bilinear', align_corners=False)
-                if self.sam_encoder[0].device != x.device:
-                    self.sam_encoder[0] = self.sam_encoder[0].to(x.device).to(self.amp_dtype)
-                sam_features_16 =  self.sam_encoder[0].vision_encoder(x.to(self.amp_dtype))
-                sam_features_16 = sam_features_16.last_hidden_state  # ✅ this is the tensor you want
-                feature_pyramid[16] = sam_features_16
-                for feat in feature_pyramid.keys():
-                    print("shape of features", feature_pyramid[feat].shape)
-                print("SAM feature stats @ scale 16:")
-                print("mean:", sam_features_16.mean().item(), "std:", sam_features_16.std().item())
-                print("min:", sam_features_16.min().item(), "max:", sam_features_16.max().item())
-                del sam_features_16
-#                feature_pyramid[16] = sam_features_16
-#        del self.sam_encoder
-        torch.cuda.empty_cache()
-        gc.collect()
+                if next(self.sam_encoder.parameters()).device != x.device:
+                    self.sam_encoder = self.sam_encoder.to(x.device)
+                    if self.amp:
+                        self.sam_encoder = self.sam_encoder.to(self.amp_dtype)
+                x_input = F.interpolate(x, size=(512, 512), mode="bilinear", align_corners=False)
+
+                # Then resize *back up* to 1024x1024 to satisfy SAM
+                x_sam = F.interpolate(x_input, size=(1024, 1024), mode="bilinear", align_corners=False)
+
+                x_sam = x_sam.to(self.amp_dtype if self.amp else x.dtype)
+                print(f"Before SAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                sam_output = self.sam_encoder(x_sam)
+                print(f"After SAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                sam_features = sam_output.last_hidden_state
+                feature_pyramid[16] = sam_features
+        
+#        if not upsample:
+#            with torch.no_grad():
+#                if self.dinov2_vitl14[0].device != x.device:
+#                    self.dinov2_vitl14[0] = self.dinov2_vitl14[0].to(x.device).to(self.amp_dtype)
+#                dinov2_features_16 = self.dinov2_vitl14[0].forward_features(x.to(self.amp_dtype))
+#                features_16 = dinov2_features_16['x_norm_patchtokens'].permute(0,2,1).reshape(B,1024,H//14, W//14)
+#                del dinov2_features_16
+#                feature_pyramid[16] = features_16
         return feature_pyramid
- 

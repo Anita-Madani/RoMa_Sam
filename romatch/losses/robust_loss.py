@@ -48,7 +48,15 @@ class RobustLosses(nn.Module):
             G = torch.meshgrid(*[torch.linspace(-1+1/cls_res, 1 - 1/cls_res, steps = cls_res,device = device) for _ in range(2)], indexing='ij')
             G = torch.stack((G[1], G[0]), dim = -1).reshape(C,2)
             GT = (G[None,:,None,None,:]-x2[:,None]).norm(dim=-1).min(dim=1).indices
-        cls_loss = F.cross_entropy(scale_gm_cls, GT, reduction  = 'none')[prob > 0.99]
+        if torch.isnan(scale_gm_cls).any():
+            print("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx NaN detected in logits before loss! xxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        print("scale_gm_cls:", scale_gm_cls.shape)
+        print("max:", scale_gm_cls.max().item(), "min:", scale_gm_cls.min().item())
+        print("GT:", GT.shape, "min:", GT.min().item(), "max:", GT.max().item())
+        print("prob > 0.99:", (prob > 0.99).sum().item())
+        mask = (prob > 0.99).float()
+        cls_loss = F.cross_entropy(scale_gm_cls, GT, reduction  = 'none')*mask
+        cls_loss = cls_loss.sum() / (mask.sum() + 1e-8)
         certainty_loss = F.binary_cross_entropy_with_logits(gm_certainty[:,0], prob)
         if not torch.any(cls_loss):
             cls_loss = (certainty_loss * 0.0)  # Prevent issues where prob is 0 everywhere
